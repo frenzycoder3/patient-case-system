@@ -57,7 +57,7 @@ function DoctorHeader() {
         <IconLeaf width={18} height={18} />
       </div>
       <div className="app-header__titles">
-        <div className="app-header__title">Arogya Katha — Doctor Portal</div>
+        <div className="app-header__title">My Health Story — Doctor Portal</div>
         <div className="app-header__subtitle">{doctor ? `${doctor.name} · ${doctor.role}` : 'Clinical Dashboard'}</div>
       </div>
       {doctor && (

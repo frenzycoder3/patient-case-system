@@ -2,399 +2,634 @@ import { useEffect, useRef, useState } from 'react'
 import { IconLeaf, IconMic } from '../components/icons'
 import { useLanguage } from '../context/LanguageContext'
 import { usePatient } from '../context/PatientContext'
-import { extractSymptomsWithAI } from '../utils/ai'
+import { extractSymptomsWithAI, generateAIClinicalResponse } from '../utils/ai'
 
-// Shown once per visit, right after the language is chosen. Speaks (and
-// shows) a simple question — would you like to tell us your problem out
-// loud, or type it yourself? Typing dismisses this screen immediately.
-// Speaking opens a full-screen listening view in the patient's chosen
-// language, then shows back what it heard so the patient can confirm or
-// fix it before it's carried into the rest of the form.
+// Text-to-speech helper that strictly awaits completion before resolving
+function speakAsync(text, lang) {
+  return new Promise((resolve) => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      resolve()
+      return
+    }
+    try {
+      window.speechSynthesis.cancel()
+      const utter = new SpeechSynthesisUtterance(text)
+      utter.lang = lang
+      utter.rate = 0.95
+      let resolved = false
+      const finish = () => {
+        if (!resolved) {
+          resolved = true
+          resolve()
+        }
+      }
+      utter.onend = finish
+      utter.onerror = finish
+
+      // Fallback timeout in case onend does not fire
+      const maxMs = Math.max(3000, (text.length / 10) * 1000 + 2000)
+      setTimeout(finish, maxMs)
+
+      window.speechSynthesis.speak(utter)
+    } catch {
+      resolve()
+    }
+  })
+}
+
+// Single-turn speech listening helper with silence detection
+function listenOnceAsync(lang, { maxSilenceMs = 2400, maxTotalMs = 15000, onRecognition } = {}) {
+  return new Promise((resolve) => {
+    const SpeechCtor =
+      typeof window !== 'undefined' && (window.SpeechRecognition || window.webkitSpeechRecognition)
+
+    if (!SpeechCtor) {
+      resolve('')
+      return
+    }
+
+    try {
+      const recognition = new SpeechCtor()
+      if (typeof onRecognition === 'function') {
+        onRecognition(recognition)
+      }
+      recognition.lang = lang
+      recognition.interimResults = true
+      recognition.continuous = true
+      recognition.maxAlternatives = 1
+
+      let accumulated = ''
+      let silenceTimer = null
+      let totalTimer = null
+      let isDone = false
+
+      const cleanup = () => {
+        if (silenceTimer) clearTimeout(silenceTimer)
+        if (totalTimer) clearTimeout(totalTimer)
+      }
+
+      const finish = () => {
+        if (isDone) return
+        isDone = true
+        cleanup()
+        try {
+          recognition.stop()
+        } catch {
+          /* ignore */
+        }
+        resolve(accumulated.trim())
+      }
+
+      recognition.onresult = (event) => {
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const chunk = event.results[i][0].transcript
+          if (event.results[i].isFinal) {
+            accumulated += `${chunk} `
+          }
+        }
+        if (silenceTimer) clearTimeout(silenceTimer)
+        silenceTimer = setTimeout(finish, maxSilenceMs)
+      }
+
+      recognition.onerror = () => {
+        finish()
+      }
+
+      recognition.onend = () => {
+        finish()
+      }
+
+      recognition.start()
+
+      // Initial silence timeout
+      silenceTimer = setTimeout(finish, 8500)
+      // Safety total timeout
+      totalTimer = setTimeout(finish, maxTotalMs)
+    } catch {
+      resolve('')
+    }
+  })
+}
+
+// Extract concise summary
+function extractSymptomSummary(text) {
+  if (!text) return ''
+  const cleaned = text.replace(/\s+/g, ' ').trim()
+  if (!cleaned) return ''
+  return cleaned.length > 220 ? `${cleaned.slice(0, 217).trim()}...` : cleaned
+}
+
+// Intelligent detection of already mentioned aspects in spoken words
+function detectSpokenAspects(text) {
+  const lower = (text || '').toLowerCase()
+
+  const hasOnset =
+    /(yesterday|days?|weeks?|months?|years?|since|ago|morning|evening|night|hours?|today|start|कल|दिन|हफ्ते|महीने|साल|सुबह|शाम|रात|நேற்று|நாள்|வாரம்|மாதம்|வருடம்|காலை|இரவு)/i.test(
+      lower
+    )
+
+  const hasSeverity =
+    /(mild|moderate|severe|unbearable|pain\s*(level|scale)?\s*[1-9]|out of 10|\b([1-9]|10)\b|कम|तेज|गंभीर|दर्द|அளவு|லேசான|கடுமையான|தாங்க)/i.test(
+      lower
+    )
+
+  const hasTrend =
+    /(better|worse|same|improving|increasing|worsening|relief|triggers?|pain increases|walking|rest|दवा|चलने|बैठने|आराम|बढ़|कम|அதிக|குறை|நிவாரணம்|மருந்து)/i.test(
+      lower
+    )
+
+  const hasOther =
+    /(fever|cough|cold|headache|vomit|nausea|weakness|fatigue|dizziness|बुखार|खांसी|कफ|कमजोरी|चक्कर|காய்ச்சல்|இருமல்|சோர்வு|தலைவலி)/i.test(
+      lower
+    )
+
+  return { hasOnset, hasSeverity, hasTrend, hasOther }
+}
+
 export default function VoiceIntro({ onDone }) {
   const { t, speechLang } = useLanguage()
   const { updateSection } = usePatient()
-  const [mode, setMode] = useState('ask') // ask | listening | confirm
-  const [transcript, setTranscript] = useState('')
-  const transcriptRef = useRef('')
-  const [messages, setMessages] = useState([])
-  const [recording, setRecording] = useState(false)
+
+  // High-level modes: 'ask' | 'active' | 'confirm'
+  const [mode, setMode] = useState('ask')
+
+  // Sub-phases during 'active' mode:
+  // 'listening_initial' | 'speaking_question' | 'listening_answer' | 'processing'
+  const [phase, setPhase] = useState('listening_initial')
+
   const [error, setError] = useState('')
-  const [readyToContinue, setReadyToContinue] = useState(false)
-  const recognitionRef = useRef(null)
-  const spokenRef = useRef(false)
-  const [backendLock, setBackendLock] = useState(false)
-  // helper to call onDone with debug logging
-  function callOnDone(reason) {
-    try {
-      // eslint-disable-next-line no-console
-      console.warn('[VoiceIntro] onDone called with reason:', reason)
-      // eslint-disable-next-line no-console
-      console.warn(new Error().stack)
-    } catch {}
-    if (typeof onDone === 'function') onDone(reason)
-  }
+  const [transcript, setTranscript] = useState('')
+  const [structuredInfo, setStructuredInfo] = useState({
+    mainComplaint: '',
+    onset: '',
+    severity: 5,
+    trend: '',
+    triggers: '',
+    relief: '',
+  })
 
-  function extractSymptomSummary(text) {
-    if (!text) return ''
+  const isRunningRef = useRef(false)
+  const activeRecognitionRef = useRef(null)
 
-    const cleaned = text.replace(/\s+/g, ' ').trim()
-    if (!cleaned) return ''
-
-    return cleaned.length > 220 ? `${cleaned.slice(0, 217).trim()}...` : cleaned
-  }
-
-  // Toggle global UI state when voice UI is active (non-ask modes)
+  // Lock the screen, apply body classes and global flag
   useEffect(() => {
     try {
-      if (mode !== 'ask') document.body.classList.add('voice-active')
-      else document.body.classList.remove('voice-active')
+      if (mode === 'active') {
+        document.body.classList.add('voice-active')
+        document.body.style.overflow = 'hidden'
+        window.__VOICE_LOCK = true
+      } else {
+        document.body.classList.remove('voice-active')
+        document.body.style.overflow = ''
+        window.__VOICE_LOCK = false
+      }
     } catch {
       /* ignore */
     }
-    try {
-      // set a global lock so the app shell won't navigate away unexpectedly
-      // while the voice UI is active. Cleared when we return to 'ask'.
-      // Also respect a backend-sent lock (SSE). Other code reads window.__VOICE_LOCK.
-      // eslint-disable-next-line no-undef
-      window.__VOICE_LOCK = mode !== 'ask' || backendLock
-    } catch {}
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+
+    return () => {
+      try {
+        document.body.classList.remove('voice-active')
+        document.body.style.overflow = ''
+        window.__VOICE_LOCK = false
+      } catch {
+        /* ignore */
+      }
+    }
   }, [mode])
 
-  // Subscribe to backend SSE voice-lock stream and update backendLock
+  // Cleanup speech synthesis and mic on unmount
   useEffect(() => {
-    if (typeof window === 'undefined' || !window.EventSource) return
-    try {
-      const es = new EventSource('/api/voice-lock/stream')
-      es.onmessage = (ev) => {
-        if (!ev.data) return
+    return () => {
+      try {
+        window.speechSynthesis?.cancel()
+      } catch {
+        /* ignore */
+      }
+      if (activeRecognitionRef.current) {
         try {
-          const payload = JSON.parse(ev.data)
-          if (payload && payload.type === 'voice-lock') {
-            setBackendLock(!!payload.locked)
-          }
-        } catch (e) {
-          // ignore non-JSON comments
+          activeRecognitionRef.current.abort()
+        } catch {
+          /* ignore */
         }
       }
-      es.onerror = () => {
-        es.close()
-      }
-      return () => es.close()
-    } catch {
-      /* ignore */
     }
   }, [])
 
-  function chooseType() {
+  function abortToTyping() {
+    isRunningRef.current = false
+    if (activeRecognitionRef.current) {
+      try {
+        activeRecognitionRef.current.onresult = null
+        activeRecognitionRef.current.onerror = null
+        activeRecognitionRef.current.onend = null
+        activeRecognitionRef.current.abort()
+        activeRecognitionRef.current.stop()
+      } catch {
+        /* ignore */
+      }
+      activeRecognitionRef.current = null
+    }
     try {
       window.speechSynthesis?.cancel()
     } catch {
       /* ignore */
     }
-    callOnDone('confirmed')
+    try {
+      document.body.classList.remove('voice-active')
+      document.body.style.overflow = ''
+      window.__VOICE_LOCK = false
+    } catch {
+      /* ignore */
+    }
+
+    if (typeof onDone === 'function') onDone('typed')
   }
 
-  function updateTranscript(text) {
-    transcriptRef.current = text
-    setTranscript(text)
+  function chooseType() {
+    abortToTyping()
   }
 
   function chooseSpeak() {
     setError('')
-    setMode('listening')
-    // clear any visible messages; do not show the initial prompt text
-    setMessages([])
-    startListening()
-  }
-
-  function startListening() {
-    const SpeechRecognitionCtor =
+    const SpeechCtor =
       typeof window !== 'undefined' && (window.SpeechRecognition || window.webkitSpeechRecognition)
 
-    if (!SpeechRecognitionCtor) {
-      setRecording(false)
+    if (!SpeechCtor) {
       setError(t('voiceIntro.unsupported'))
-      setMode('ask')
       return
     }
 
-    const recognition = new SpeechRecognitionCtor()
-    recognition.lang = speechLang
-    recognition.interimResults = true
-    // Use non-continuous mode so recognition stops automatically on silence
-    recognition.continuous = false
-    recognition.maxAlternatives = 1
-    recognitionRef.current = recognition
+    // Enter LOCKED active voice mode
+    setMode('active')
+    runVoiceWorkflow()
+  }
 
-    let finalText = ''
+  // Orchestrates the multi-turn AI listening and conversational response workflow
+  async function runVoiceWorkflow() {
+    if (isRunningRef.current) return
+    isRunningRef.current = true
 
-    recognition.onstart = () => setRecording(true)
-    recognition.onresult = (event) => {
-      let interim = ''
-      for (let i = event.resultIndex; i < event.results.length; i++) {
-        const chunk = event.results[i][0].transcript
-        if (event.results[i].isFinal) finalText += `${chunk} `
-        else interim += chunk
-      }
-      updateTranscript((finalText + interim).trim())
-    }
-    recognition.onerror = () => {
-      setRecording(false)
-      setError(t('voiceIntro.unsupported'))
-      setMode('ask')
-    }
-    recognition.onend = async () => {
-      setRecording(false)
-      // Prefer the locally-accumulated finalText; fall back to the last
-      // known transcript snapshot. Avoid switching back to the 'ask'
-      // screen on empty results — stay on the listening UI.
-      const spokenText = (finalText || transcriptRef.current || '').replace(/\s+/g, ' ').trim()
-      if (spokenText) {
-        updateTranscript(spokenText)
-        // Automatically process the transcript with AI and run follow-up
-        await processTranscript(spokenText)
-      } else {
-        // No speech detected — remain on listening mode so user can try again
+    try {
+      // PHASE 1: Listen to initial complaint
+      setPhase('listening_initial')
+      const initialText = await listenOnceAsync(speechLang, {
+        maxSilenceMs: 2500,
+        maxTotalMs: 16000,
+        onRecognition: (r) => {
+          activeRecognitionRef.current = r
+        },
+      })
+
+      if (!isRunningRef.current) return
+
+      if (!initialText) {
+        setPhase('processing')
         setError(t('voiceIntro.emptyTranscript'))
-        setMode('listening')
-      }
-    }
-
-    recognition.start()
-  }
-
-  // Removed manual stop: recognition now stops automatically on silence
-
-  async function confirmTranscript() {
-    const cleanedTranscript = transcript.trim()
-    if (!cleanedTranscript) {
-      setError(t('voiceIntro.emptyTranscript'))
-      return
-    }
-
-    try {
-      const aiResult = await extractSymptomsWithAI(cleanedTranscript, speechLang)
-      const extractedSummary = aiResult.mainComplaint || extractSymptomSummary(cleanedTranscript)
-
-      updateSection('symptomJourney', {
-        mainComplaint: extractedSummary,
-        ownWords: cleanedTranscript,
-      })
-      callOnDone('confirmed')
-    } catch {
-      const extractedSummary = extractSymptomSummary(cleanedTranscript)
-      updateSection('symptomJourney', {
-        mainComplaint: extractedSummary,
-        ownWords: cleanedTranscript,
-      })
-      callOnDone('confirmed')
-    }
-  }
-
-  function backToAsk() {
-    try {
-      recognitionRef.current?.stop()
-    } catch {
-      /* ignore */
-    }
-    updateTranscript('')
-    setError('')
-    setMode('ask')
-  }
-
-  function speakText(text) {
-    try {
-      if (typeof window !== 'undefined' && window.speechSynthesis) {
-        const utter = new SpeechSynthesisUtterance(text)
-        utter.lang = speechLang
-        window.speechSynthesis.speak(utter)
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-
-  function listenOnce(timeout = 10000) {
-    return new Promise((resolve) => {
-      const SpeechRecognitionCtor =
-        typeof window !== 'undefined' && (window.SpeechRecognition || window.webkitSpeechRecognition)
-      if (!SpeechRecognitionCtor) {
-        resolve('')
+        setMode('ask')
+        isRunningRef.current = false
         return
       }
 
-      const r = new SpeechRecognitionCtor()
-      r.lang = speechLang
-      r.interimResults = false
-      r.continuous = false
-      let resultText = ''
-      r.onstart = () => setRecording(true)
-      r.onresult = (ev) => {
-        resultText = Array.from(ev.results).map((rs) => rs[0].transcript).join(' ')
+      let combinedTranscript = initialText.trim()
+      setTranscript(combinedTranscript)
+      const conversation = [{ role: 'user', text: initialText }]
+
+      // PHASE 2: AI Listening & Contextual Response (Powered by Gemini / OpenAI / Clinical Engine)
+      setPhase('processing')
+      const aiResponse = await generateAIClinicalResponse({
+        userSpeech: combinedTranscript,
+        conversation,
+        language: speechLang,
+      })
+
+      if (!isRunningRef.current) return
+
+      if (aiResponse) {
+        // AI speaks its contextual clinical question (NO on-screen subtitle captions)
+        setPhase('speaking_question')
+        await speakAsync(aiResponse, speechLang)
+
+        if (!isRunningRef.current) return
+
+        // Listen to the patient's answer (NO on-screen captions)
+        setPhase('listening_answer')
+        const patientAnswer = await listenOnceAsync(speechLang, {
+          maxSilenceMs: 2400,
+          maxTotalMs: 14000,
+          onRecognition: (r) => {
+            activeRecognitionRef.current = r
+          },
+        })
+
+        if (!isRunningRef.current) return
+
+        if (patientAnswer) {
+          combinedTranscript = `${combinedTranscript}. ${patientAnswer}`
+          setTranscript(combinedTranscript)
+          conversation.push({ role: 'assistant', text: aiResponse })
+          conversation.push({ role: 'user', text: patientAnswer })
+
+          // Optional 2nd turn if severity or onset are still missing
+          const aspects = detectSpokenAspects(combinedTranscript)
+          if (!aspects.hasSeverity || !aspects.hasOnset) {
+            setPhase('processing')
+            const secondResponse = await generateAIClinicalResponse({
+              userSpeech: combinedTranscript,
+              conversation,
+              language: speechLang,
+            })
+
+            if (!isRunningRef.current) return
+
+            if (secondResponse && secondResponse !== aiResponse) {
+              setPhase('speaking_question')
+              await speakAsync(secondResponse, speechLang)
+
+              if (!isRunningRef.current) return
+
+              setPhase('listening_answer')
+              const secondAnswer = await listenOnceAsync(speechLang, {
+                maxSilenceMs: 2400,
+                maxTotalMs: 12000,
+                onRecognition: (r) => {
+                  activeRecognitionRef.current = r
+                },
+              })
+
+              if (!isRunningRef.current) return
+
+              if (secondAnswer) {
+                combinedTranscript = `${combinedTranscript}. ${secondAnswer}`
+                setTranscript(combinedTranscript)
+              }
+            }
+          }
+        }
       }
-      r.onerror = () => {
-        setRecording(false)
-        resolve('')
-      }
-      r.onend = () => {
-        setRecording(false)
-        resolve((resultText || '').trim())
-      }
+
+      // PHASE 3: AI Synthesis & Structured Case Extraction
+      setPhase('processing')
+
+      let aiResult = { mainComplaint: '', structured: {} }
       try {
-        r.start()
+        aiResult = await extractSymptomsWithAI(combinedTranscript, speechLang)
       } catch {
-        resolve('')
+        aiResult = { mainComplaint: extractSymptomSummary(combinedTranscript), structured: {} }
       }
-      // safety timeout
-      setTimeout(() => {
-        try {
-          r.stop()
-        } catch {
-          /* ignore */
+
+      if (!isRunningRef.current) return
+
+      const mainComplaint =
+        aiResult.structured?.mainComplaint ||
+        aiResult.mainComplaint ||
+        extractSymptomSummary(combinedTranscript) ||
+        combinedTranscript
+
+      // Determine structured severity
+      let detectedSeverity = aiResult.structured?.severity || 5
+      if (!aiResult.structured?.severity) {
+        const sevMatches = combinedTranscript.match(/\b([1-9]|10)\b/)
+        if (sevMatches) {
+          detectedSeverity = Math.min(10, Math.max(1, parseInt(sevMatches[1], 10)))
+        } else if (/severe|unbearable|तेज|கடுமையான/i.test(combinedTranscript)) {
+          detectedSeverity = 8
+        } else if (/mild|कम|லேசான/i.test(combinedTranscript)) {
+          detectedSeverity = 3
         }
-      }, timeout)
-    })
+      }
+
+      // Determine trend
+      let detectedTrend = aiResult.structured?.trend || ''
+      if (!detectedTrend) {
+        if (/worse|बढ़|அதிக/i.test(combinedTranscript)) detectedTrend = 'Worse'
+        else if (/better|कम|குறை/i.test(combinedTranscript)) detectedTrend = 'Better'
+        else if (/same|वैसा|அப்படியே/i.test(combinedTranscript)) detectedTrend = 'Same'
+      }
+
+      // Determine onset date if mentioned
+      let detectedStartDate = aiResult.structured?.onset || ''
+      if (!detectedStartDate || detectedStartDate.length > 15) {
+        const now = new Date()
+        if (/yesterday|कल|நேற்று/i.test(combinedTranscript)) {
+          const d = new Date(now)
+          d.setDate(d.getDate() - 1)
+          detectedStartDate = d.toISOString().split('T')[0]
+        } else {
+          const daysMatch = combinedTranscript.match(/(\d+)\s*(days?|दिन|நாட்கள்)/i)
+          if (daysMatch) {
+            const count = parseInt(daysMatch[1], 10)
+            if (!isNaN(count) && count > 0 && count < 365) {
+              const d = new Date(now)
+              d.setDate(d.getDate() - count)
+              detectedStartDate = d.toISOString().split('T')[0]
+            }
+          }
+        }
+      }
+
+      // Determine onset type
+      let detectedOnsetType = ''
+      if (/sudden|suddenly|achanak|अचानक|திடீரென/i.test(combinedTranscript)) {
+        detectedOnsetType = 'Sudden'
+      } else if (/gradual|slowly|dhire|धीरे|படிப்படியாக/i.test(combinedTranscript)) {
+        detectedOnsetType = 'Gradual'
+      }
+
+      const extractedInfo = {
+        mainComplaint,
+        onset: detectedStartDate || 'Mentioned in audio',
+        severity: detectedSeverity,
+        trend: detectedTrend,
+        triggers: aiResult.structured?.triggers || '',
+        relief: aiResult.structured?.relief || '',
+      }
+
+      setStructuredInfo(extractedInfo)
+
+      // Save to global PatientContext
+      const journeyUpdate = {
+        mainComplaint,
+        severity: detectedSeverity,
+        trend: detectedTrend,
+        ownWords: combinedTranscript,
+      }
+      if (detectedStartDate && detectedStartDate.length <= 12) journeyUpdate.startDate = detectedStartDate
+      if (detectedOnsetType) journeyUpdate.onsetType = detectedOnsetType
+      updateSection('symptomJourney', journeyUpdate)
+
+      // Speak polite closing acknowledgment
+      await speakAsync(t('voiceIntro.closingMessage'), speechLang)
+
+      if (!isRunningRef.current) return
+      // Switch to confirmation mode
+      setMode('confirm')
+    } catch (e) {
+      if (!isRunningRef.current) return
+      const summary = extractSymptomSummary(transcript)
+      updateSection('symptomJourney', {
+        mainComplaint: summary,
+        ownWords: transcript,
+      })
+      setMode('confirm')
+    } finally {
+      isRunningRef.current = false
+      activeRecognitionRef.current = null
+    }
   }
 
-  async function processTranscript(initialText) {
-    setError('')
-    setMode('processing')
-    setMessages((m) => [...m, { role: 'assistant', text: t('voiceIntro.processing') }])
-    const maxFollowUps = 3
-    let combined = (initialText || '').trim()
-    if (!combined) {
-      setError(t('voiceIntro.emptyTranscript'))
-      setMode('ask')
-      return
-    }
-
+  function handleConfirmContinue() {
     try {
-      let aiResult = await extractSymptomsWithAI(combined, speechLang)
-      let structured = aiResult.structured || {}
-      let followUps = []
-      if (!structured.onset) followUps.push('onset')
-      if (!structured.severity) followUps.push('severity')
-
-      let attempts = 0
-      while (followUps.length && attempts < maxFollowUps) {
-        const field = followUps.shift()
-        const question = field === 'onset' ? t('voiceIntro.followUpOnset') : t('voiceIntro.followUpSeverity')
-        // speak the follow-up question but do not display the literal text
-        speakText(question)
-        const answer = await listenOnce(8000)
-        if (answer) {
-            // do not display user's spoken answer in the chat UI
-          combined = `${combined} ${answer}`
-          aiResult = await extractSymptomsWithAI(combined, speechLang)
-          structured = aiResult.structured || {}
-          // recompute missing
-          followUps = []
-          if (!structured.onset) followUps.push('onset')
-          if (!structured.severity) followUps.push('severity')
-        }
-        attempts++
-      }
-
-      const mainComplaint = aiResult.mainComplaint || extractSymptomSummary(combined)
-      updateSection('symptomJourney', { mainComplaint, ownWords: combined })
-      setMessages((m) => [...m, { role: 'assistant', text: aiResult.mainComplaint || mainComplaint }])
-      // keep voice UI visible; let user continue when ready
-      setReadyToContinue(true)
-      setMode('listening')
-    } catch (err) {
-      // fallback: use transcript directly
-      const extractedSummary = extractSymptomSummary(combined)
-      updateSection('symptomJourney', { mainComplaint: extractedSummary, ownWords: combined })
-      setMessages((m) => [...m, { role: 'assistant', text: extractedSummary }])
-      setReadyToContinue(true)
-      setMode('listening')
+      window.speechSynthesis?.cancel()
+    } catch {
+      /* ignore */
     }
+    if (typeof onDone === 'function') onDone('confirmed')
   }
 
-  if (mode === 'listening' || mode === 'confirm') {
+  function handleRecordAgain() {
+    try {
+      window.speechSynthesis?.cancel()
+    } catch {
+      /* ignore */
+    }
+    isRunningRef.current = false
+    setTranscript('')
+    setError('')
+    chooseSpeak()
+  }
+
+  // 1. ACTIVE MODE: FULLSCREEN VOICE DIALOG (HELD FOCUSED WITHOUT LOCK BADGE)
+  if (mode === 'active') {
     return (
-      <div className="voice-fullscreen">
+      <div className="voice-fullscreen" role="dialog" aria-modal="true">
         <div className="voice-fullscreen__inner">
-          <div className={`voice-fullscreen__orb ${recording ? 'voice-fullscreen__orb--live' : ''}`}>
-            <IconMic width={32} height={32} />
-          </div>
+          {/* NOTICE: Lock badge removed per user request: "dont display like session is locked" */}
 
-          {mode === 'listening' && (
-            <>
-              <h1>{recording ? t('voiceIntro.listeningTitle') : t('voiceIntro.startingTitle')}</h1>
-              <p className="voice-fullscreen__hint">{t('voiceIntro.listeningHint')}</p>
-
-              <div className="voice-chat" aria-live="polite">
-                <div className="voice-chat__messages">
-                  {messages.map((m, idx) => (
-                    <div key={idx} className={`voice-chat__message ${m.role === 'user' ? 'voice-chat__message--user' : 'voice-chat__message--assistant'}`}>
-                      <div className="voice-chat__bubble">{m.text}</div>
-                    </div>
-                  ))}
-                </div>
+          {/* Dynamic Voice Orb: pulsing mic when listening, wave bars when speaking */}
+          {phase === 'speaking_question' ? (
+            <div className="voice-fullscreen__orb voice-fullscreen__orb--speaking">
+              <div className="voice-speaking-wave" aria-hidden="true">
+                <span />
+                <span />
+                <span />
+                <span />
+                <span />
               </div>
-              {error && <div className="field-error">{error}</div>}
-              {readyToContinue && (
-                <div className="voice-fullscreen__actions-bottom">
-                  <button type="button" className="btn btn-secondary" onClick={() => { setMode('confirm'); setReadyToContinue(false) }}>
-                    {t('voiceIntro.tryAgain')}
-                  </button>
-                  <button type="button" className="btn btn-primary" onClick={() => { callOnDone('confirmed') }}>
-                    {t('common.continue')}
-                  </button>
-                </div>
-              )}
-            </>
-          )}
-
-          {mode === 'processing' && (
-            <div className="voice-status">
+            </div>
+          ) : phase === 'processing' ? (
+            <div className="voice-fullscreen__orb">
               <div className="spinner" />
-              <div>{t('voiceIntro.processing')}</div>
+            </div>
+          ) : (
+            <div className="voice-fullscreen__orb voice-fullscreen__orb--live">
+              <IconMic width={36} height={36} />
             </div>
           )}
 
-          {mode === 'confirm' && (
+          {/* Titles & Hints WITHOUT displaying speech subtitle text */}
+          {phase === 'speaking_question' && (
             <>
-              <h1>{t('voiceIntro.confirmTitle')}</h1>
-              <p className="voice-fullscreen__hint">{t('voiceIntro.confirmHint')}</p>
-              <textarea
-                className="voice-fullscreen__edit"
-                value={transcript}
-                onChange={(e) => {
-                  updateTranscript(e.target.value)
-                  setError('')
-                }}
-                rows={5}
-              />
-              {error && <div className="field-error">{error}</div>}
-              <div className="voice-fullscreen__actions">
-                <button type="button" className="btn btn-secondary" onClick={backToAsk}>
-                  {t('voiceIntro.tryAgain')}
-                </button>
-                <button type="button" className="btn btn-primary" onClick={confirmTranscript}>
-                  {t('voiceIntro.confirmContinue')}
-                </button>
-              </div>
+              <h1>{t('voiceIntro.assistantSpeaking')}</h1>
+              <p className="voice-fullscreen__hint">
+                Please listen to the AI question…
+              </p>
             </>
           )}
+
+          {(phase === 'listening_initial' || phase === 'listening_answer') && (
+            <>
+              <h1>{t('voiceIntro.listeningTitle')}</h1>
+              <p className="voice-fullscreen__hint">{t('voiceIntro.listeningHint')}</p>
+            </>
+          )}
+
+          {phase === 'processing' && (
+            <>
+              <h1>{t('voiceIntro.processing')}</h1>
+              <p className="voice-fullscreen__hint">AI is analyzing your symptoms…</p>
+            </>
+          )}
+
+          {/* Prominent, working Switch to Typing button */}
+          <div style={{ marginTop: 28 }}>
+            <button
+              type="button"
+              className="voice-switch-btn"
+              onClick={abortToTyping}
+            >
+              <span>⌨️</span>
+              <span>{t('voiceIntro.switchToTyping')}</span>
+            </button>
+          </div>
         </div>
       </div>
     )
   }
 
+  // 2. CONFIRM MODE: INTAKE COMPLETED, REVIEW DETAILS
+  if (mode === 'confirm') {
+    return (
+      <div className="voice-fullscreen" role="dialog" aria-modal="true">
+        <div className="voice-fullscreen__inner">
+          <div className="welcome__mark" style={{ margin: '0 auto 16px' }}>
+            <IconLeaf />
+          </div>
+
+          <h1>{t('voiceIntro.confirmTitle')}</h1>
+          <p className="voice-fullscreen__hint">{t('voiceIntro.confirmHint')}</p>
+
+          <div className="voice-confirm-card">
+            <div className="voice-confirm-item">
+              <div className="voice-confirm-item__label">Main Complaint</div>
+              <div className="voice-confirm-item__value">
+                {structuredInfo.mainComplaint || transcript || 'Recorded via speech'}
+              </div>
+            </div>
+
+            {structuredInfo.severity && (
+              <div className="voice-confirm-item">
+                <div className="voice-confirm-item__label">Severity Rating</div>
+                <div className="voice-confirm-item__value">{structuredInfo.severity} / 10</div>
+              </div>
+            )}
+
+            {structuredInfo.trend && (
+              <div className="voice-confirm-item">
+                <div className="voice-confirm-item__label">Trend</div>
+                <div className="voice-confirm-item__value">{structuredInfo.trend}</div>
+              </div>
+            )}
+          </div>
+
+          <div className="voice-fullscreen__actions">
+            <button type="button" className="btn btn-secondary" onClick={handleRecordAgain}>
+              {t('voiceIntro.tryAgain')}
+            </button>
+            <button type="button" className="btn btn-primary" onClick={handleConfirmContinue}>
+              {t('voiceIntro.confirmContinue')}
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  // 3. ASK MODE: INITIAL CHOICE SCREEN
   return (
     <div className="voice-intro-screen">
       <div className="voice-intro-card">
         <div className="welcome__mark">
           <IconLeaf />
         </div>
-        {/* choice UI: buttons only — remove header and subtitle per user request */}
-        {error && <div className="field-error">{error}</div>}
+
+        {error && <div className="field-error" style={{ marginBottom: 14 }}>{error}</div>}
+
         <div className="voice-intro-actions">
           <button type="button" className="voice-intro-choice" onClick={chooseSpeak}>
-            <span className="voice-intro-choice__icon"><IconMic width={22} height={22} /></span>
+            <span className="voice-intro-choice__icon">
+              <IconMic width={22} height={22} />
+            </span>
             <span>
               <strong>{t('voiceIntro.speakOption')}</strong>
               <small>{t('voiceIntro.speakOptionHint')}</small>
