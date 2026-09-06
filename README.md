@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # My Health Story — Patient Case-Taking MVP
 
 **SIH26047 · Ministry of AYUSH · Patient Case-Taking Software**
@@ -132,3 +133,6 @@ already used by `PatientContext.jsx`.
 This app only **collects, organizes, and presents** patient information.
 It never diagnoses, never recommends medicine, and never replaces a
 doctor's judgment — the Doctor Summary says this explicitly.
+=======
+# patient-case-system
+>>>>>>> 90c7a03b3ccb10b5cd06be1040c67676dd411908
