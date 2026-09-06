@@ -713,7 +713,7 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
 .voice-fullscreen {
   position: fixed;
   inset: 0;
-  z-index: 100;
+  z-index: 1000;
   background: var(--primary-dark);
   background: radial-gradient(circle at 50% 0%, var(--primary-glow), var(--primary-dark) 70%);
   display: flex;
@@ -727,6 +727,23 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   text-align: center;
   color: white;
 }
+.voice-lock-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: rgba(255, 255, 255, 0.95);
+  padding: 6px 14px;
+  border-radius: 99px;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  margin-bottom: 22px;
+}
+.voice-lock-badge__icon {
+  font-size: 13px;
+}
 .voice-fullscreen__orb {
   width: 84px; height: 84px; border-radius: 50%;
   margin: 0 auto 24px;
@@ -739,38 +756,91 @@ textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible {
   animation: voice-pulse 1.4s ease-in-out infinite;
   border-color: rgba(255,255,255,0.7);
 }
+.voice-fullscreen__orb--speaking {
+  border-color: rgba(255, 255, 255, 0.85);
+  background: rgba(255, 255, 255, 0.2);
+}
+.voice-speaking-wave {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 32px;
+}
+.voice-speaking-wave span {
+  display: block;
+  width: 4px;
+  height: 100%;
+  background: white;
+  border-radius: 2px;
+  animation: wave-pulse 1.1s ease-in-out infinite;
+}
+.voice-speaking-wave span:nth-child(2) { animation-delay: 0.15s; }
+.voice-speaking-wave span:nth-child(3) { animation-delay: 0.3s; }
+.voice-speaking-wave span:nth-child(4) { animation-delay: 0.45s; }
+.voice-speaking-wave span:nth-child(5) { animation-delay: 0.6s; }
+@keyframes wave-pulse {
+  0%, 100% { transform: scaleY(0.25); opacity: 0.4; }
+  50% { transform: scaleY(1); opacity: 1; }
+}
 @keyframes voice-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(255,255,255,0.35); }
   50% { box-shadow: 0 0 0 16px rgba(255,255,255,0); }
 }
 .voice-fullscreen__inner h1 { color: white; font-size: 24px; margin-bottom: 8px; }
 .voice-fullscreen__hint { color: rgba(255,255,255,0.78); font-size: 14.5px; margin-bottom: 22px; }
-.voice-fullscreen__transcript {
-  min-height: 90px;
-  background: rgba(255,255,255,0.1);
-  border: 1.5px solid rgba(255,255,255,0.25);
+.voice-confirm-card {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1.5px solid rgba(255, 255, 255, 0.25);
   border-radius: var(--radius-md);
   padding: 16px 18px;
-  font-size: 16px;
-  line-height: 1.5;
-  margin-bottom: 26px;
   text-align: left;
+  margin-bottom: 24px;
 }
-.voice-fullscreen__placeholder { color: rgba(255,255,255,0.55); font-style: italic; }
-.voice-fullscreen__edit {
-  width: 100%;
-  min-height: 130px;
-  background: rgba(255,255,255,0.95);
-  color: var(--ink);
-  border: none;
-  border-radius: var(--radius-md);
-  padding: 14px 16px;
+.voice-confirm-item {
+  margin-bottom: 12px;
+}
+.voice-confirm-item:last-child {
+  margin-bottom: 0;
+}
+.voice-confirm-item__label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: rgba(255, 255, 255, 0.65);
+  margin-bottom: 2px;
+  font-weight: 600;
+}
+.voice-confirm-item__value {
   font-size: 15px;
-  font-family: var(--font-body);
-  margin-bottom: 20px;
-  resize: vertical;
+  font-weight: 500;
+  color: white;
+  line-height: 1.4;
 }
-.voice-fullscreen__actions { display: flex; gap: 12px; }
+.voice-switch-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(255, 255, 255, 0.15);
+  border: 1.5px solid rgba(255, 255, 255, 0.35);
+  color: white;
+  padding: 10px 22px;
+  border-radius: 99px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  user-select: none;
+}
+.voice-switch-btn:hover {
+  background: rgba(255, 255, 255, 0.28);
+  border-color: rgba(255, 255, 255, 0.65);
+  transform: translateY(-1px);
+}
+.voice-switch-btn:active {
+  transform: translateY(0);
+}
+.voice-fullscreen__actions { display: flex; gap: 12px; justify-content: center; }
 .voice-fullscreen__actions .btn-secondary { background: rgba(255,255,255,0.12); color: white; border-color: rgba(255,255,255,0.35); }
 .voice-fullscreen .btn-primary { background: white; color: var(--primary-dark); }
 .voice-fullscreen .btn-primary:hover { background: rgba(255,255,255,0.88); }
